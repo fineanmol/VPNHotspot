@@ -9,16 +9,16 @@ import be.mygod.vpnhotspot.App.Companion.app
 import be.mygod.vpnhotspot.R
 import be.mygod.vpnhotspot.net.InetAddressComparator
 import be.mygod.vpnhotspot.net.IpNeighbour
+import be.mygod.vpnhotspot.net.MacAddressCompat
 import be.mygod.vpnhotspot.net.TetherType
 import be.mygod.vpnhotspot.room.AppDatabase
 import be.mygod.vpnhotspot.room.ClientRecord
-import be.mygod.vpnhotspot.room.macToString
 import be.mygod.vpnhotspot.util.makeIpSpan
 import be.mygod.vpnhotspot.util.makeMacSpan
 import java.net.InetAddress
 import java.util.*
 
-open class Client(val mac: Long, val iface: String) {
+open class Client(val mac: MacAddressCompat, val iface: String) {
     companion object DiffCallback : DiffUtil.ItemCallback<Client>() {
         override fun areItemsTheSame(oldItem: Client, newItem: Client) =
                 oldItem.iface == newItem.iface && oldItem.mac == newItem.mac
@@ -26,7 +26,7 @@ open class Client(val mac: Long, val iface: String) {
     }
 
     val ip = TreeMap<InetAddress, IpNeighbour.State>(InetAddressComparator)
-    val macString by lazy { mac.macToString() }
+    val macString by lazy { mac.toString() }
     private val record = AppDatabase.instance.clientRecordDao.lookupOrDefaultSync(mac)
     private val macIface get() = SpannableStringBuilder(makeMacSpan(macString)).apply {
         append('%')
@@ -52,20 +52,20 @@ open class Client(val mac: Long, val iface: String) {
     val titleSelectable = record.map { it.nickname.isEmpty() }
     val description = record.map { record ->
         SpannableStringBuilder().apply {
-            if (record.nickname.isNotEmpty()) appendln(macIface)
+            if (record.nickname.isNotEmpty()) appendLine(macIface)
             ip.entries.forEach { (ip, state) ->
                 append(makeIpSpan(ip))
-                appendln(app.getText(when (state) {
+                appendLine(app.getText(when (state) {
                     IpNeighbour.State.INCOMPLETE -> R.string.connected_state_incomplete
                     IpNeighbour.State.VALID -> R.string.connected_state_valid
                     IpNeighbour.State.FAILED -> R.string.connected_state_failed
-                    else -> throw IllegalStateException("Invalid IpNeighbour.State: $state")
+                    else -> error("Invalid IpNeighbour.State: $state")
                 }))
             }
         }.trimEnd()
     }
 
-    fun obtainRecord() = record.value ?: ClientRecord(mac)
+    fun obtainRecord() = record.value ?: ClientRecord(mac.addr)
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true

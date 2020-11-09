@@ -1,19 +1,19 @@
 package be.mygod.vpnhotspot
 
 import android.content.Intent
-import android.content.IntentFilter
+import android.os.Build
+import androidx.annotation.RequiresApi
 import be.mygod.vpnhotspot.App.Companion.app
 import be.mygod.vpnhotspot.net.Routing
-import be.mygod.vpnhotspot.net.TetherType
 import be.mygod.vpnhotspot.net.TetheringManager
-import be.mygod.vpnhotspot.net.TetheringManager.tetheredIfaces
 import be.mygod.vpnhotspot.net.monitor.IpNeighbourMonitor
 import be.mygod.vpnhotspot.util.Event0
-import be.mygod.vpnhotspot.util.broadcastReceiver
+import be.mygod.vpnhotspot.widget.SmartSnackbar
 import kotlinx.coroutines.*
+import timber.log.Timber
 import java.util.concurrent.ConcurrentHashMap
 
-class TetheringService : IpNeighbourMonitoringService(), CoroutineScope {
+class TetheringService : IpNeighbourMonitoringService(), TetheringManager.TetheringEventCallback, CoroutineScope {
     companion object {
         const val EXTRA_ADD_INTERFACES = "interface.add"
         const val EXTRA_ADD_INTERFACE_MONITOR = "interface.add.monitor"
@@ -29,8 +29,8 @@ class TetheringService : IpNeighbourMonitoringService(), CoroutineScope {
         fun monitored(iface: String) = downstreams[iface]?.monitor
     }
 
-    private inner class Downstream(caller: Any, downstream: String, var monitor: Boolean = false) :
-            RoutingManager(caller, downstream, TetherType.ofInterface(downstream).isWifi) {
+    private class Downstream(caller: Any, downstream: String, var monitor: Boolean = false) :
+            RoutingManager(caller, downstream) {
         override fun Routing.configure() {
             forward()
             masquerade(masqueradeMode)
@@ -42,25 +42,38 @@ class TetheringService : IpNeighbourMonitoringService(), CoroutineScope {
     /**
      * Writes and critical reads to downstreams should be protected with this context.
      */
-    override val coroutineContext = newSingleThreadContext("TetheringService") + Job()
+    private val dispatcher = newSingleThreadContext("TetheringService")
+    override val coroutineContext = dispatcher + Job()
     private val binder = Binder()
     private val downstreams = ConcurrentHashMap<String, Downstream>()
-    private var receiverRegistered = false
-    private val receiver = broadcastReceiver { _, intent ->
+    private var callbackRegistered = false
+    override val activeIfaces get() = downstreams.values.filter { it.started }.map { it.downstream }
+    override val inactiveIfaces get() = downstreams.values.filter { !it.started }.map { it.downstream }
+
+    override fun onTetheredInterfacesChanged(interfaces: List<String?>) {
         launch {
             val toRemove = downstreams.toMutableMap()   // make a copy
-            for (iface in intent.tetheredIfaces ?: return@launch) {
+            for (iface in interfaces) {
                 val downstream = toRemove.remove(iface) ?: continue
                 if (downstream.monitor) downstream.start()
             }
             for ((iface, downstream) in toRemove) {
-                if (downstream.monitor) downstream.stop() else downstreams.remove(iface)?.destroy()
+                if (!downstream.monitor) check(downstreams.remove(iface, downstream))
+                downstream.stop()
             }
             onDownstreamsChangedLocked()
         }
     }
-    override val activeIfaces get() = downstreams.values.filter { it.started }.map { it.downstream }
-    override val inactiveIfaces get() = downstreams.values.filter { !it.started }.map { it.downstream }
+
+    @RequiresApi(30)
+    override fun onOffloadStatusChanged(status: Int) = when (status) {
+        TetheringManager.TETHER_HARDWARE_OFFLOAD_STOPPED, TetheringManager.TETHER_HARDWARE_OFFLOAD_FAILED -> { }
+        TetheringManager.TETHER_HARDWARE_OFFLOAD_STARTED -> {
+            Timber.w("TETHER_HARDWARE_OFFLOAD_STARTED")
+            SmartSnackbar.make(R.string.tethering_manage_offload_enabled).show()
+        }
+        else -> Timber.w(IllegalStateException("Unknown onOffloadStatusChanged $status"))
+    }
 
     private fun onDownstreamsChangedLocked() {
         if (downstreams.isEmpty()) {
@@ -68,9 +81,9 @@ class TetheringService : IpNeighbourMonitoringService(), CoroutineScope {
             ServiceNotification.stopForeground(this)
             stopSelf()
         } else {
-            if (!receiverRegistered) {
-                receiverRegistered = true
-                registerReceiver(receiver, IntentFilter(TetheringManager.ACTION_TETHER_STATE_CHANGED))
+            if (!callbackRegistered) {
+                callbackRegistered = true
+                TetheringManager.registerTetheringEventCallbackCompat(this, this)
                 IpNeighbourMonitor.registerCallback(this)
             }
             updateNotification()
@@ -81,11 +94,13 @@ class TetheringService : IpNeighbourMonitoringService(), CoroutineScope {
     override fun onBind(intent: Intent?) = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // call this first just in case we are shutting down immediately
+        if (Build.VERSION.SDK_INT >= 26) updateNotification()
         launch {
             if (intent != null) {
                 for (iface in intent.getStringArrayExtra(EXTRA_ADD_INTERFACES) ?: emptyArray()) {
                     if (downstreams[iface] == null) Downstream(this@TetheringService, iface).apply {
-                        if (start()) check(downstreams.put(iface, this) == null) else destroy()
+                        if (start()) check(downstreams.put(iface, this) == null) else stop()
                     }
                 }
                 intent.getStringExtra(EXTRA_ADD_INTERFACE_MONITOR)?.also { iface ->
@@ -96,8 +111,7 @@ class TetheringService : IpNeighbourMonitoringService(), CoroutineScope {
                         downstreams[iface] = this
                     } else downstream.monitor = true
                 }
-                intent.getStringExtra(EXTRA_REMOVE_INTERFACE)?.also { downstreams.remove(it)?.destroy() }
-                updateNotification()    // call this first just in case we are shutting down immediately
+                intent.getStringExtra(EXTRA_REMOVE_INTERFACE)?.also { downstreams.remove(it)?.stop() }
                 onDownstreamsChangedLocked()
             } else if (downstreams.isEmpty()) stopSelf(startId)
         }
@@ -106,18 +120,19 @@ class TetheringService : IpNeighbourMonitoringService(), CoroutineScope {
 
     override fun onDestroy() {
         launch {
-            downstreams.values.forEach { it.destroy() } // force clean to prevent leakage
             unregisterReceiver()
+            downstreams.values.forEach { it.stop() }    // force clean to prevent leakage
             cancel()
+            dispatcher.close()
         }
         super.onDestroy()
     }
 
     private fun unregisterReceiver() {
-        if (receiverRegistered) {
-            unregisterReceiver(receiver)
+        if (callbackRegistered) {
+            TetheringManager.unregisterTetheringEventCallbackCompat(this, this)
             IpNeighbourMonitor.unregisterCallback(this)
-            receiverRegistered = false
+            callbackRegistered = false
         }
     }
 }

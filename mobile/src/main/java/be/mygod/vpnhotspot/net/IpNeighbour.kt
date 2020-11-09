@@ -2,18 +2,21 @@ package be.mygod.vpnhotspot.net
 
 import android.os.Build
 import android.system.ErrnoException
+import android.system.Os
 import android.system.OsConstants
-import be.mygod.vpnhotspot.room.macToLong
+import be.mygod.vpnhotspot.root.ReadArp
+import be.mygod.vpnhotspot.root.RootManager
 import be.mygod.vpnhotspot.util.parseNumericAddress
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.runBlocking
 import timber.log.Timber
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.net.Inet4Address
 import java.net.InetAddress
-import java.net.NetworkInterface
-import java.net.SocketException
 
-data class IpNeighbour(val ip: InetAddress, val dev: String, val lladdr: Long, val state: State) {
+data class IpNeighbour(val ip: InetAddress, val dev: String, val lladdr: MacAddressCompat, val state: State) {
     enum class State {
         INCOMPLETE, VALID, FAILED, DELETING
     }
@@ -33,45 +36,66 @@ data class IpNeighbour(val ip: InetAddress, val dev: String, val lladdr: Long, v
          * Source: https://android.googlesource.com/platform/external/iproute2/+/4b9e917/lib/ll_map.c#152
          */
         private val devFallback = "^if(\\d+)\$".toRegex()
-        private fun checkLladdrNotLoopback(lladdr: String) = if (lladdr == "00:00:00:00:00:00") "" else lladdr
 
-        fun parse(line: String): List<IpNeighbour> {
-            return try {
+        private fun substituteDev(dev: String): Set<String> {
+            val devParser = devFallback.matchEntire(dev)
+            if (devParser != null) {
+                val index = devParser.groupValues[1].toInt()
+                Os.if_indextoname(index)?.let { iface -> return setOf(dev, iface) }
+                Timber.w("Failed to find network interface #$index")
+            }
+            return setOf(dev)
+        }
+
+        fun parse(line: String, fullMode: Boolean): List<IpNeighbour> {
+            return if (line.isBlank()) emptyList() else try {
                 val match = parser.matchEntire(line)!!
                 val ip = parseNumericAddress(match.groupValues[2])  // by regex, ip is non-empty
-                val dev = match.groupValues[3]                      // by regex, dev is non-empty as well
-                var lladdr = checkLladdrNotLoopback(match.groupValues[5])
-                // use ARP as fallback for IPv4
-                if (lladdr.isEmpty()) lladdr = checkLladdrNotLoopback(arp()
-                        .asSequence()
-                        .filter { parseNumericAddress(it[ARP_IP_ADDRESS]) == ip && it[ARP_DEVICE] == dev }
-                        .map { it[ARP_HW_ADDRESS] }
-                        .singleOrNull() ?: "")
-                val state = if (match.groupValues[1].isNotEmpty()) State.DELETING else
-                    when (match.groupValues[7]) {
-                        "", "INCOMPLETE" -> State.INCOMPLETE
-                        "REACHABLE", "DELAY", "STALE", "PROBE", "PERMANENT" -> State.VALID
-                        "FAILED" -> State.FAILED
-                        "NOARP" -> return emptyList()   // skip
-                        else -> throw IllegalArgumentException("Unknown state encountered: ${match.groupValues[7]}")
-                    }
-                val mac = try {
-                    lladdr.macToLong()
-                } catch (e: NumberFormatException) {
-                    if (match.groups[4] == null) return emptyList()
-                    // for DELETING, we only care about IP address and do not care if MAC is not present
-                    if (state != State.DELETING) Timber.w(IOException("Failed to find MAC address for $line"))
-                    0L
+                val devs = substituteDev(match.groupValues[3])      // by regex, dev is non-empty as well
+                val state = if (match.groupValues[1].isNotEmpty()) State.DELETING else when (match.groupValues[7]) {
+                    "", "INCOMPLETE" -> State.INCOMPLETE
+                    "REACHABLE", "DELAY", "STALE", "PROBE", "PERMANENT" -> State.VALID
+                    "FAILED" -> State.FAILED
+                    "NOARP" -> return emptyList()   // skip
+                    else -> throw IllegalArgumentException("Unknown state encountered: ${match.groupValues[7]}")
                 }
-                val result = IpNeighbour(ip, dev, mac, state)
-                val devParser = devFallback.matchEntire(dev)
-                if (devParser != null) try {
-                    val index = devParser.groupValues[1].toInt()
-                    val iface = NetworkInterface.getByIndex(index)
-                    if (iface == null) Timber.w("Failed to find network interface #$index")
-                    else return listOf(IpNeighbour(ip, iface.name, mac, state), result)
-                } catch (_: SocketException) { }
-                listOf(result)
+                var lladdr = MacAddressCompat.ALL_ZEROS_ADDRESS
+                if (!fullMode && state != State.VALID) {
+                    // skip parsing lladdr to avoid requesting root
+                    return devs.map { IpNeighbour(ip, it, lladdr, State.DELETING) }
+                }
+                if (match.groups[4] != null) try {
+                    lladdr = MacAddressCompat.fromString(match.groupValues[5])
+                } catch (e: IllegalArgumentException) {
+                    if (state != State.INCOMPLETE && state != State.DELETING) {
+                        Timber.w(IOException("Failed to find MAC address for $line", e))
+                    }
+                }
+                // use ARP as fallback for IPv4, except for INCOMPLETE which by definition does not have arp entry,
+                // or for DELETING, which we do not care about MAC not present
+                if (lladdr == MacAddressCompat.ALL_ZEROS_ADDRESS && state != State.INCOMPLETE &&
+                        state != State.DELETING) {
+                    if (ip is Inet4Address) try {
+                        val list = arp()
+                                .asSequence()
+                                .filter { parseNumericAddress(it[ARP_IP_ADDRESS]) == ip && it[ARP_DEVICE] in devs }
+                                .map { it[ARP_HW_ADDRESS] }
+                                .distinct()
+                                .toList()
+                        when (list.size) {
+                            1 -> lladdr = MacAddressCompat.fromString(list.single())
+                            0 -> { }
+                            else -> throw IllegalArgumentException("Unexpected output in arp: ${list.joinToString()}")
+                        }
+                    } catch (e: IllegalArgumentException) {
+                        Timber.w(e)
+                    }
+                    if (lladdr == MacAddressCompat.ALL_ZEROS_ADDRESS) {
+                        Timber.d(line)
+                        return emptyList()
+                    }
+                }
+                devs.map { IpNeighbour(ip, it, lladdr, state) }
             } catch (e: Exception) {
                 Timber.w(IllegalArgumentException("Unable to parse line: $line", e))
                 emptyList()
@@ -88,19 +112,32 @@ data class IpNeighbour(val ip: InetAddress, val dev: String, val lladdr: Long, v
         private const val ARP_CACHE_EXPIRE = 1L * 1000 * 1000 * 1000
         private var arpCache = emptyList<List<String>>()
         private var arpCacheTime = -ARP_CACHE_EXPIRE
+        private fun Sequence<String>.makeArp() = this
+                .map { it.split(spaces) }
+                .drop(1)
+                .filter { it.size >= 6 && mac.matcher(it[ARP_HW_ADDRESS]).matches() }
+                .toList()
         private fun arp(): List<List<String>> {
             if (System.nanoTime() - arpCacheTime >= ARP_CACHE_EXPIRE) try {
-                arpCache = File("/proc/net/arp").bufferedReader().readLines()
-                        .asSequence()
-                        .map { it.split(spaces) }
-                        .drop(1)
-                        .filter { it.size >= 6 && mac.matcher(it[ARP_HW_ADDRESS]).matches() }
-                        .toList()
+                arpCache = File("/proc/net/arp").bufferedReader().lineSequence().makeArp()
             } catch (e: IOException) {
-                if (e !is FileNotFoundException || Build.VERSION.SDK_INT < 29 ||
-                        (e.cause as? ErrnoException)?.errno != OsConstants.EACCES) Timber.w(e)
+                if (e is FileNotFoundException && Build.VERSION.SDK_INT >= 29 &&
+                        (e.cause as? ErrnoException)?.errno == OsConstants.EACCES) try {
+                    arpCache = runBlocking {
+                        RootManager.use { it.execute(ReadArp()) }
+                    }.value.lineSequence().makeArp()
+                } catch (eRoot: Exception) {
+                    eRoot.addSuppressed(e)
+                    if (eRoot !is CancellationException) Timber.w(eRoot)
+                } else Timber.w(e)
             }
             return arpCache
         }
     }
 }
+
+data class IpDev(val ip: InetAddress, val dev: String) {
+    override fun toString() = "$ip%$dev"
+}
+@Suppress("FunctionName")
+fun IpDev(neighbour: IpNeighbour) = IpDev(neighbour.ip, neighbour.dev)

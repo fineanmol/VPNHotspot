@@ -1,35 +1,91 @@
 package be.mygod.vpnhotspot.net.monitor
 
-import be.mygod.vpnhotspot.App.Companion.app
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import be.mygod.vpnhotspot.util.Services
+import be.mygod.vpnhotspot.util.allInterfaceNames
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import timber.log.Timber
+import java.util.regex.PatternSyntaxException
 
-class InterfaceMonitor(val iface: String) : UpstreamMonitor() {
-    private fun setPresent(present: Boolean) = synchronized(this) {
-        val old = currentIface != null
-        if (present == old) return
-        currentIface = if (present) iface else null
-        if (present) {
-            val dns = currentDns
-            callbacks.forEach { it.onAvailable(iface, dns) }
-        } else callbacks.forEach { it.onLost() }
+class InterfaceMonitor(private val ifaceRegex: String) : UpstreamMonitor() {
+    private val iface = try {
+        ifaceRegex.toRegex()::matches
+    } catch (e: PatternSyntaxException) {
+        Timber.d(e);
+        { it == ifaceRegex }
+    }
+    private val request = networkRequestBuilder().apply {
+        removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
+        removeCapability(NetworkCapabilities.NET_CAPABILITY_TRUSTED)
+        removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+    }.build()
+    private var registered = false
+
+    private val available = HashMap<Network, LinkProperties?>()
+    private var currentNetwork: Network? = null
+    override val currentLinkProperties: LinkProperties? get() = currentNetwork?.let { available[it] }
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            val properties = Services.connectivity.getLinkProperties(network)
+            if (properties?.allInterfaceNames?.any(iface) != true) return
+            synchronized(this@InterfaceMonitor) {
+                available[network] = properties
+                currentNetwork = network
+                callbacks.toList()
+            }.forEach { it.onAvailable(properties) }
+        }
+
+        override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) {
+            val matched = properties.allInterfaceNames.any(iface)
+            synchronized(this@InterfaceMonitor) {
+                if (!matched) {
+                    if (currentNetwork == network) currentNetwork = null
+                    available.remove(network)
+                    return
+                }
+                available[network] = properties
+                if (currentNetwork == null) currentNetwork = network
+                else if (currentNetwork != network) return
+                callbacks.toList()
+            }.forEach { it.onAvailable(properties) }
+        }
+
+        override fun onLost(network: Network) {
+            var properties: LinkProperties? = null
+            synchronized(this@InterfaceMonitor) {
+                if (available.remove(network) == null || currentNetwork != network) return
+                if (available.isNotEmpty()) {
+                    val next = available.entries.first()
+                    currentNetwork = next.key
+                    Timber.d("Switching to ${next.value} for $ifaceRegex")
+                    properties = next.value
+                } else currentNetwork = null
+                callbacks.toList()
+            }.forEach { it.onAvailable(properties) }
+        }
     }
 
-    private var registered = false
-    override var currentIface: String? = null
-        private set
-    override val currentLinkProperties get() = app.connectivity.allNetworks
-            .map { app.connectivity.getLinkProperties(it) }
-            .singleOrNull { it?.interfaceName == iface }
-
     override fun registerCallbackLocked(callback: Callback) {
-        if (!registered) {
-            IpLinkMonitor.registerCallback(this, iface, this::setPresent)
+        if (registered) {
+            val currentLinkProperties = currentLinkProperties
+            if (currentLinkProperties != null) GlobalScope.launch {
+                callback.onAvailable(currentLinkProperties)
+            }
+        } else {
+            Services.connectivity.registerNetworkCallback(request, networkCallback)
             registered = true
-        } else if (currentIface != null) callback.onAvailable(iface, currentDns)
+        }
     }
 
     override fun destroyLocked() {
-        IpLinkMonitor.unregisterCallback(this)
-        currentIface = null
+        if (!registered) return
+        Services.connectivity.unregisterNetworkCallback(networkCallback)
         registered = false
+        available.clear()
+        currentNetwork = null
     }
 }

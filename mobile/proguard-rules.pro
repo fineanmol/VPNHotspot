@@ -14,12 +14,16 @@
 
 # Uncomment this to preserve the line number information for
 # debugging stack traces.
--keepattributes *Annotation*
 -keepattributes SourceFile,LineNumberTable
 -dontobfuscate
 
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
--dontwarn org.mockito.**
--dontwarn org.objenesis.instantiator.**
+
+-if public class be.mygod.librootkotlinx.RootServer {
+    private void doInit(android.content.Context, java.lang.String);
+}
+-keep class be.mygod.librootkotlinx.RootServer {
+    public static void main(java.lang.String[]);
+}

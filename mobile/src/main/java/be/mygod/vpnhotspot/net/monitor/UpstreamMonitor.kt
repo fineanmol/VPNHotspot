@@ -2,13 +2,12 @@ package be.mygod.vpnhotspot.net.monitor
 
 import android.content.SharedPreferences
 import android.net.LinkProperties
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.os.Build
 import be.mygod.vpnhotspot.App.Companion.app
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
-import java.lang.UnsupportedOperationException
-import java.net.InetAddress
-import java.util.*
-import java.util.concurrent.ConcurrentHashMap
 
 abstract class UpstreamMonitor {
     companion object : SharedPreferences.OnSharedPreferenceChangeListener {
@@ -24,6 +23,13 @@ abstract class UpstreamMonitor {
         }
         private var monitor = generateMonitor()
 
+        fun networkRequestBuilder() = NetworkRequest.Builder().apply {
+            if (Build.VERSION.SDK_INT == 23) {  // workarounds for OEM bugs
+                removeCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                removeCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL)
+            }
+        }
+
         fun registerCallback(callback: Callback) = synchronized(this) { monitor.registerCallback(callback) }
         fun unregisterCallback(callback: Callback) = synchronized(this) { monitor.unregisterCallback(callback) }
 
@@ -31,19 +37,15 @@ abstract class UpstreamMonitor {
             if (key == KEY) GlobalScope.launch {    // prevent callback called in main
                 synchronized(this) {
                     val old = monitor
-                    val (active, callbacks) = synchronized(old) {
-                        val active = old.currentIface != null
-                        val callbacks = old.callbacks.toList()
-                        old.callbacks.clear()
-                        old.destroyLocked()
-                        Pair(active, callbacks)
+                    val callbacks = synchronized(old) {
+                        old.callbacks.toList().also {
+                            old.callbacks.clear()
+                            old.destroyLocked()
+                        }
                     }
                     val new = generateMonitor()
                     monitor = new
-                    for (callback in callbacks) {
-                        if (active) callback.onLost()
-                        new.registerCallback(callback)
-                    }
+                    for (callback in callbacks) new.registerCallback(callback)
                 }
             }
         }
@@ -51,14 +53,9 @@ abstract class UpstreamMonitor {
 
     interface Callback {
         /**
-         * Called if some interface is available. This might be called on different ifname without having called onLost.
-         * This might also be called on the same ifname but with updated DNS list.
+         * Called if some possibly stacked interface is available
          */
-        fun onAvailable(ifname: String, dns: List<InetAddress>)
-        /**
-         * Called if no interface is available.
-         */
-        fun onLost()
+        fun onAvailable(properties: LinkProperties? = null)
         /**
          * Called on API 23- from DefaultNetworkMonitor. This indicates that there isn't a good way of telling the
          * default network (see DefaultNetworkMonitor) and we are using rules at priority 22000
@@ -70,13 +67,8 @@ abstract class UpstreamMonitor {
         }
     }
 
-    val callbacks = Collections.newSetFromMap(ConcurrentHashMap<Callback, Boolean>())
+    val callbacks = mutableSetOf<Callback>()
     protected abstract val currentLinkProperties: LinkProperties?
-    open val currentIface: String? get() = currentLinkProperties?.interfaceName
-    /**
-     * There's no need for overriding currentDns for now.
-     */
-    val currentDns: List<InetAddress> get() = currentLinkProperties?.dnsServers ?: emptyList()
     protected abstract fun registerCallbackLocked(callback: Callback)
     abstract fun destroyLocked()
 

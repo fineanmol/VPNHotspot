@@ -2,29 +2,27 @@ package be.mygod.vpnhotspot
 
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.res.Configuration
 import android.net.wifi.WifiManager
 import android.os.Build
-import android.os.Handler
 import androidx.annotation.RequiresApi
-import be.mygod.vpnhotspot.App.Companion.app
 import be.mygod.vpnhotspot.net.IpNeighbour
+import be.mygod.vpnhotspot.net.TetherType
 import be.mygod.vpnhotspot.net.TetheringManager
 import be.mygod.vpnhotspot.net.TetheringManager.localOnlyTetheredIfaces
 import be.mygod.vpnhotspot.net.monitor.IpNeighbourMonitor
 import be.mygod.vpnhotspot.net.monitor.TetherTimeoutMonitor
+import be.mygod.vpnhotspot.net.wifi.SoftApConfigurationCompat.Companion.toCompat
+import be.mygod.vpnhotspot.net.wifi.WifiApManager
+import be.mygod.vpnhotspot.util.Services
 import be.mygod.vpnhotspot.util.StickyEvent1
 import be.mygod.vpnhotspot.util.broadcastReceiver
 import be.mygod.vpnhotspot.widget.SmartSnackbar
 import kotlinx.coroutines.*
 import timber.log.Timber
+import java.net.Inet4Address
 
 @RequiresApi(26)
 class LocalOnlyHotspotService : IpNeighbourMonitoringService(), CoroutineScope {
-    companion object {
-        private const val TAG = "LocalOnlyHotspotService"
-    }
-
     inner class Binder : android.os.Binder() {
         /**
          * null represents IDLE, "" represents CONNECTING, "something" represents CONNECTED.
@@ -36,9 +34,17 @@ class LocalOnlyHotspotService : IpNeighbourMonitoringService(), CoroutineScope {
             }
         val ifaceChanged = StickyEvent1 { iface }
 
-        val configuration get() = reservation?.wifiConfiguration
+        val configuration get() = if (Build.VERSION.SDK_INT < 30) @Suppress("DEPRECATION") {
+            reservation?.wifiConfiguration?.toCompat()
+        } else reservation?.softApConfiguration?.toCompat()
 
-        fun stop() = reservation?.close()
+        fun stop() {
+            when (iface) {
+                null -> return  // stopped
+                "" -> WifiApManager.cancelLocalOnlyHotspotRequest()
+            }
+            reservation?.close() ?: stopService()
+        }
     }
 
     private val binder = Binder()
@@ -46,50 +52,47 @@ class LocalOnlyHotspotService : IpNeighbourMonitoringService(), CoroutineScope {
     /**
      * Writes and critical reads to routingManager should be protected with this context.
      */
-    override val coroutineContext = newSingleThreadContext("LocalOnlyHotspotService") + Job()
+    private val dispatcher = newSingleThreadContext("LocalOnlyHotspotService")
+    override val coroutineContext = dispatcher + Job()
     private var routingManager: RoutingManager? = null
-    private val handler = Handler()
-    @RequiresApi(28)
     private var timeoutMonitor: TetherTimeoutMonitor? = null
     private var receiverRegistered = false
     private val receiver = broadcastReceiver { _, intent ->
-        val ifaces = intent.localOnlyTetheredIfaces ?: return@broadcastReceiver
-        DebugHelper.log(TAG, "onTetherStateChangedLocked: $ifaces")
+        val ifaces = (intent.localOnlyTetheredIfaces ?: return@broadcastReceiver).filter {
+            TetherType.ofInterface(it) != TetherType.WIFI_P2P
+        }
+        Timber.d("onTetherStateChangedLocked: $ifaces")
         check(ifaces.size <= 1)
         val iface = ifaces.singleOrNull()
         binder.iface = iface
-        if (iface.isNullOrEmpty()) {
-            unregisterReceiver()
-            ServiceNotification.stopForeground(this)
-            stopSelf()
-        } else launch {
+        if (iface.isNullOrEmpty()) stopService() else launch {
             val routingManager = routingManager
             if (routingManager == null) {
-                this@LocalOnlyHotspotService.routingManager = RoutingManager.LocalOnly(this, iface).apply { start() }
+                this@LocalOnlyHotspotService.routingManager = RoutingManager.LocalOnly(this@LocalOnlyHotspotService,
+                        iface).apply { start() }
                 IpNeighbourMonitor.registerCallback(this@LocalOnlyHotspotService)
             } else check(iface == routingManager.downstream)
         }
     }
-    override val activeIfaces get() = listOfNotNull(binder.iface)
+    override val activeIfaces get() = binder.iface.let { if (it.isNullOrEmpty()) emptyList() else listOf(it) }
 
     override fun onBind(intent: Intent?) = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (binder.iface != null) return START_STICKY
         binder.iface = ""
-        // show invisible foreground notification on television to avoid being killed
-        if (app.uiMode.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION) updateNotification()
-        // throws IllegalStateException if the caller attempts to start the LocalOnlyHotspot while they
-        // have an outstanding request.
-        // https://android.googlesource.com/platform/frameworks/opt/net/wifi/+/53e0284/service/java/com/android/server/wifi/WifiServiceImpl.java#1192
+        updateNotification()    // show invisible foreground notification to avoid being killed
         try {
-            app.wifi.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
+            Services.wifi.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
                 override fun onStarted(reservation: WifiManager.LocalOnlyHotspotReservation?) {
                     if (reservation == null) onFailed(-2) else {
                         this@LocalOnlyHotspotService.reservation = reservation
                         if (!receiverRegistered) {
-                            if (Build.VERSION.SDK_INT >= 28) timeoutMonitor = TetherTimeoutMonitor(
-                                    this@LocalOnlyHotspotService, handler, reservation::close)
+                            val configuration = binder.configuration!!
+                            if (Build.VERSION.SDK_INT < 30 && configuration.isAutoShutdownEnabled) {
+                                timeoutMonitor = TetherTimeoutMonitor(configuration.shutdownTimeoutMillis,
+                                        coroutineContext) { reservation.close() }
+                            }
                             registerReceiver(receiver, IntentFilter(TetheringManager.ACTION_TETHER_STATE_CHANGED))
                             receiverRegistered = true
                         }
@@ -97,7 +100,7 @@ class LocalOnlyHotspotService : IpNeighbourMonitoringService(), CoroutineScope {
                 }
 
                 override fun onStopped() {
-                    DebugHelper.log(TAG, "LOHCallback.onStopped")
+                    Timber.d("LOHCallback.onStopped")
                     reservation = null
                 }
 
@@ -111,31 +114,27 @@ class LocalOnlyHotspotService : IpNeighbourMonitoringService(), CoroutineScope {
                         }
                         else -> getString(R.string.failure_reason_unknown, reason)
                     })).show()
-                    startFailure()
+                    stopService()
                 }
             }, null)
         } catch (e: IllegalStateException) {
-            Timber.w(e)
+            // throws IllegalStateException if the caller attempts to start the LocalOnlyHotspot while they
+            // have an outstanding request.
+            // https://android.googlesource.com/platform/frameworks/opt/net/wifi/+/53e0284/service/java/com/android/server/wifi/WifiServiceImpl.java#1192
+            WifiApManager.cancelLocalOnlyHotspotRequest()
             SmartSnackbar.make(e).show()
-            startFailure()
+            stopService()
         } catch (e: SecurityException) {
             SmartSnackbar.make(e).show()
-            startFailure()
+            stopService()
         }
         return START_STICKY
     }
 
-    private fun startFailure() {
-        binder.iface = null
-        updateNotification()
-        ServiceNotification.stopForeground(this@LocalOnlyHotspotService)
-        stopSelf()
-    }
-
-    override fun onIpNeighbourAvailable(neighbours: List<IpNeighbour>) {
+    override fun onIpNeighbourAvailable(neighbours: Collection<IpNeighbour>) {
         super.onIpNeighbourAvailable(neighbours)
         if (Build.VERSION.SDK_INT >= 28) timeoutMonitor?.onClientsChanged(neighbours.none {
-            it.state != IpNeighbour.State.FAILED
+            it.ip is Inet4Address && it.state == IpNeighbour.State.VALID
         })
     }
 
@@ -143,6 +142,13 @@ class LocalOnlyHotspotService : IpNeighbourMonitoringService(), CoroutineScope {
         binder.stop()
         unregisterReceiver(true)
         super.onDestroy()
+    }
+
+    private fun stopService() {
+        binder.iface = null
+        unregisterReceiver()
+        ServiceNotification.stopForeground(this)
+        stopSelf()
     }
 
     private fun unregisterReceiver(exit: Boolean = false) {
@@ -156,9 +162,12 @@ class LocalOnlyHotspotService : IpNeighbourMonitoringService(), CoroutineScope {
             receiverRegistered = false
         }
         launch {
-            routingManager?.destroy()
+            routingManager?.stop()
             routingManager = null
-            if (exit) cancel()
+            if (exit) {
+                cancel()
+                dispatcher.close()
+            }
         }
     }
 }

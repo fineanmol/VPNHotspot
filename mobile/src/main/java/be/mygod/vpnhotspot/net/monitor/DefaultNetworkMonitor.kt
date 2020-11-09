@@ -1,96 +1,64 @@
 package be.mygod.vpnhotspot.net.monitor
 
 import android.annotation.TargetApi
-import android.net.*
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
-import be.mygod.vpnhotspot.App.Companion.app
-import timber.log.Timber
+import be.mygod.vpnhotspot.util.Services
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
 
 object DefaultNetworkMonitor : UpstreamMonitor() {
     private var registered = false
-    private var currentNetwork: Network? = null
     override var currentLinkProperties: LinkProperties? = null
         private set
     /**
      * Unfortunately registerDefaultNetworkCallback is going to return VPN interface since Android P DP1:
      * https://android.googlesource.com/platform/frameworks/base/+/dda156ab0c5d66ad82bdcf76cda07cbc0a9c8a2e
      */
-    private val networkRequest = NetworkRequest.Builder()
+    private val networkRequest = networkRequestBuilder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
             .build()
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
-            val properties = app.connectivity.getLinkProperties(network)
-            val ifname = properties?.interfaceName ?: return
+            val properties = Services.connectivity.getLinkProperties(network)
             synchronized(this@DefaultNetworkMonitor) {
-                when (currentNetwork) {
-                    null -> { }
-                    network -> {
-                        val oldProperties = currentLinkProperties!!
-                        check(ifname == oldProperties.interfaceName)
-                        if (properties.dnsServers == oldProperties.dnsServers) return
-                    }
-                    else -> callbacks.forEach { it.onLost() }   // we are using the other default network now
-                }
-                currentNetwork = network
                 currentLinkProperties = properties
-                callbacks.forEach { it.onAvailable(ifname, properties.dnsServers) }
-            }
+                callbacks.toList()
+            }.forEach { it.onAvailable(properties) }
         }
 
         override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) {
             synchronized(this@DefaultNetworkMonitor) {
-                if (currentNetwork == null) {
-                    onAvailable(network)
-                    return
-                }
-                if (currentNetwork != network) return
-                val oldProperties = currentLinkProperties!!
                 currentLinkProperties = properties
-                val ifname = properties.interfaceName
-                when {
-                    ifname == null -> {
-                        Timber.w("interfaceName became null: $oldProperties -> $properties")
-                        onLost(network)
-                    }
-                    ifname != oldProperties.interfaceName -> {
-                        Timber.w(RuntimeException("interfaceName changed: $oldProperties -> $properties"))
-                        callbacks.forEach {
-                            it.onLost()
-                            it.onAvailable(ifname, properties.dnsServers)
-                        }
-                    }
-                    properties.dnsServers != oldProperties.dnsServers -> callbacks.forEach {
-                        it.onAvailable(ifname, properties.dnsServers)
-                    }
-                }
-            }
+                callbacks.toList()
+            }.forEach { it.onAvailable(properties) }
         }
 
         override fun onLost(network: Network) = synchronized(this@DefaultNetworkMonitor) {
-            if (currentNetwork != network) return
-            callbacks.forEach { it.onLost() }
-            currentNetwork = null
             currentLinkProperties = null
-        }
+            callbacks.toList()
+        }.forEach { it.onAvailable() }
     }
 
     override fun registerCallbackLocked(callback: Callback) {
         if (registered) {
             val currentLinkProperties = currentLinkProperties
-            if (currentLinkProperties != null) {
-                callback.onAvailable(currentLinkProperties.interfaceName!!, currentLinkProperties.dnsServers)
+            if (currentLinkProperties != null) GlobalScope.launch {
+                callback.onAvailable(currentLinkProperties)
             }
         } else {
             if (Build.VERSION.SDK_INT in 24..27) @TargetApi(24) {
-                app.connectivity.registerDefaultNetworkCallback(networkCallback)
+                Services.connectivity.registerDefaultNetworkCallback(networkCallback)
             } else try {
-                app.connectivity.requestNetwork(networkRequest, networkCallback)
+                Services.connectivity.requestNetwork(networkRequest, networkCallback)
             } catch (e: SecurityException) {
                 // SecurityException would be thrown in requestNetwork on Android 6.0 thanks to Google's stupid bug
                 if (Build.VERSION.SDK_INT != 23) throw e
-                callback.onFallback()
+                GlobalScope.launch { callback.onFallback() }
                 return
             }
             registered = true
@@ -99,9 +67,8 @@ object DefaultNetworkMonitor : UpstreamMonitor() {
 
     override fun destroyLocked() {
         if (!registered) return
-        app.connectivity.unregisterNetworkCallback(networkCallback)
+        Services.connectivity.unregisterNetworkCallback(networkCallback)
         registered = false
-        currentNetwork = null
         currentLinkProperties = null
     }
 }

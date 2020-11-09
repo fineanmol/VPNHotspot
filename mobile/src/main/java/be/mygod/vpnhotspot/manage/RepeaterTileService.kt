@@ -12,6 +12,7 @@ import androidx.core.content.ContextCompat
 import be.mygod.vpnhotspot.R
 import be.mygod.vpnhotspot.RepeaterService
 import be.mygod.vpnhotspot.util.KillableTileService
+import be.mygod.vpnhotspot.util.Services
 import be.mygod.vpnhotspot.util.stopAndUnbind
 
 @RequiresApi(24)
@@ -22,12 +23,13 @@ class RepeaterTileService : KillableTileService() {
 
     override fun onStartListening() {
         super.onStartListening()
-        if (!RepeaterService.supported) updateTile()
-        else bindService(Intent(this, RepeaterService::class.java), this, Context.BIND_AUTO_CREATE)
+        if (Services.p2p != null) {
+            bindService(Intent(this, RepeaterService::class.java), this, Context.BIND_AUTO_CREATE)
+        } else updateTile()
     }
 
     override fun onStopListening() {
-        if (RepeaterService.supported) stopAndUnbind(this)
+        if (Services.p2p != null) stopAndUnbind(this)
         super.onStopListening()
     }
 
@@ -35,8 +37,8 @@ class RepeaterTileService : KillableTileService() {
         val binder = binder
         if (binder == null) tapPending = true else when (binder.service.status) {
             RepeaterService.Status.ACTIVE -> binder.shutdown()
-            RepeaterService.Status.IDLE ->
-                ContextCompat.startForegroundService(this, Intent(this, RepeaterService::class.java))
+            RepeaterService.Status.IDLE -> ContextCompat.startForegroundService(this,
+                    Intent(this, RepeaterService::class.java))
             else -> { }
         }
     }
@@ -57,6 +59,7 @@ class RepeaterTileService : KillableTileService() {
 
     private fun updateTile(group: WifiP2pGroup? = binder?.group) {
         qsTile?.run {
+            subtitle(null)
             when ((binder ?: return).service.status) {
                 RepeaterService.Status.IDLE -> {
                     state = Tile.STATE_INACTIVE
@@ -65,6 +68,9 @@ class RepeaterTileService : KillableTileService() {
                 RepeaterService.Status.ACTIVE -> {
                     state = Tile.STATE_ACTIVE
                     label = group?.networkName
+                    val size = group?.clientList?.size ?: 0
+                    if (size > 0) subtitle(resources.getQuantityString(
+                            R.plurals.quick_settings_hotspot_secondary_label_num_devices, size, size))
                 }
                 else -> {   // STARTING or DESTROYED, which should never occur
                     state = Tile.STATE_UNAVAILABLE

@@ -1,11 +1,15 @@
 package be.mygod.vpnhotspot.util
 
 import android.annotation.SuppressLint
+import android.annotation.TargetApi
 import android.content.*
 import android.net.InetAddresses
+import android.net.LinkProperties
+import android.net.RouteInfo
 import android.os.Build
-import android.os.Parcel
-import android.os.Parcelable
+import android.os.Handler
+import android.os.RemoteException
+import android.system.Os
 import android.text.Spannable
 import android.text.SpannableString
 import android.text.SpannableStringBuilder
@@ -13,17 +17,32 @@ import android.view.MenuItem
 import android.view.View
 import android.widget.ImageView
 import androidx.annotation.DrawableRes
+import androidx.annotation.RequiresApi
 import androidx.core.net.toUri
 import androidx.core.view.isVisible
 import androidx.databinding.BindingAdapter
+import androidx.fragment.app.DialogFragment
+import androidx.fragment.app.FragmentManager
 import be.mygod.vpnhotspot.App.Companion.app
-import be.mygod.vpnhotspot.room.macToString
+import be.mygod.vpnhotspot.net.MacAddressCompat
 import be.mygod.vpnhotspot.widget.SmartSnackbar
+import timber.log.Timber
+import java.io.File
+import java.io.FileNotFoundException
+import java.lang.invoke.MethodHandles
+import java.lang.reflect.InvocationHandler
+import java.lang.reflect.InvocationTargetException
+import java.lang.reflect.Method
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.SocketException
+import java.util.concurrent.Executor
 
-val Throwable.readableMessage get() = localizedMessage ?: javaClass.name
+tailrec fun Throwable.getRootCause(): Throwable {
+    if (this is InvocationTargetException || this is RemoteException) return (cause ?: return this).getRootCause()
+    return this
+}
+val Throwable.readableMessage: String get() = getRootCause().run { localizedMessage ?: javaClass.name }
 
 /**
  * This is a hack: we wrap longs around in 1 billion and such. Hopefully every language counts in base 10 and this works
@@ -35,23 +54,16 @@ fun Long.toPluralInt(): Int {
     return (this % 1000000000).toInt() + 1000000000
 }
 
-@SuppressLint("Recycle")
-fun <T> useParcel(block: (Parcel) -> T) = Parcel.obtain().run {
+fun Context.ensureReceiverUnregistered(receiver: BroadcastReceiver) {
     try {
-        block(this)
-    } finally {
-        recycle()
-    }
+        unregisterReceiver(receiver)
+    } catch (_: IllegalArgumentException) { }
 }
 
-fun Parcelable.toByteArray(parcelableFlags: Int = 0) = useParcel { p ->
-    p.writeParcelable(this, parcelableFlags)
-    p.marshall()
-}
-fun <T : Parcelable> ByteArray.toParcelable() = useParcel { p ->
-    p.unmarshall(this, 0, size)
-    p.setDataPosition(0)
-    p.readParcelable<T>(javaClass.classLoader)
+fun Handler?.makeExecutor() = Executor { if (this == null) it.run() else post(it) }
+
+fun DialogFragment.showAllowingStateLoss(manager: FragmentManager, tag: String? = null) {
+    if (!manager.isStateSaved) show(manager, tag)
 }
 
 fun broadcastReceiver(receiver: (Context, Intent) -> Unit) = object : BroadcastReceiver() {
@@ -82,11 +94,11 @@ fun makeMacSpan(mac: String) = if (app.hasTouch) SpannableString(mac).apply {
 
 fun NetworkInterface.formatAddresses(macOnly: Boolean = false) = SpannableStringBuilder().apply {
     try {
-        hardwareAddress?.apply { appendln(makeMacSpan(asIterable().macToString())) }
+        hardwareAddress?.let { appendLine(makeMacSpan(MacAddressCompat.bytesToString(it))) }
     } catch (_: SocketException) { }
     if (!macOnly) for (address in interfaceAddresses) {
         append(makeIpSpan(address.address))
-        appendln("/${address.networkPrefixLength}")
+        appendLine("/${address.networkPrefixLength}")
     }
 }.trimEnd()
 
@@ -95,8 +107,16 @@ private val parseNumericAddress by lazy @SuppressLint("SoonBlockedPrivateApi") {
         isAccessible = true
     }
 }
-fun parseNumericAddress(address: String) = if (Build.VERSION.SDK_INT >= 29)
-    InetAddresses.parseNumericAddress(address) else parseNumericAddress.invoke(null, address) as InetAddress
+fun parseNumericAddress(address: String) = if (Build.VERSION.SDK_INT >= 29) {
+    InetAddresses.parseNumericAddress(address)
+} else parseNumericAddress(null, address) as InetAddress
+
+private val getAllInterfaceNames by lazy { LinkProperties::class.java.getDeclaredMethod("getAllInterfaceNames") }
+@Suppress("UNCHECKED_CAST")
+val LinkProperties.allInterfaceNames get() = getAllInterfaceNames.invoke(this) as List<String>
+private val getAllRoutes by lazy { LinkProperties::class.java.getDeclaredMethod("getAllRoutes") }
+@Suppress("UNCHECKED_CAST")
+val LinkProperties.allRoutes get() = getAllRoutes.invoke(this) as List<RouteInfo>
 
 fun Context.launchUrl(url: String) {
     if (app.hasTouch) try {
@@ -118,14 +138,45 @@ var MenuItem.isNotGone: Boolean
         isEnabled = value
     }
 
-fun <K, V> MutableMap<K, V>.computeIfAbsentCompat(key: K, value: () -> V) = if (Build.VERSION.SDK_INT >= 24)
-    computeIfAbsent(key) { value() } else this[key] ?: value().also { put(key, it) }
-fun <K, V> MutableMap<K, V>.putIfAbsentCompat(key: K, value: V) = if (Build.VERSION.SDK_INT >= 24)
-    putIfAbsent(key, value) else this[key] ?: put(key, value)
-fun <K, V> MutableMap<K, V>.removeCompat(key: K, value: V) = if (Build.VERSION.SDK_INT >= 24) remove(key, value) else {
-    val curValue = get(key)
-    if (curValue === value && (curValue != null || containsKey(key))) {
-        remove(key)
-        true
-    } else false
+@get:RequiresApi(26)
+private val newLookup by lazy @TargetApi(26) {
+    MethodHandles.Lookup::class.java.getDeclaredConstructor(Class::class.java, Int::class.java).apply {
+        isAccessible = true
+    }
+}
+
+/**
+ * Call interface super method.
+ *
+ * See also: https://stackoverflow.com/a/49532463/2245107
+ */
+fun InvocationHandler.callSuper(interfaceClass: Class<*>, proxy: Any, method: Method, args: Array<out Any?>?) = when {
+    Build.VERSION.SDK_INT >= 26 && method.isDefault -> newLookup.newInstance(interfaceClass, 0xf)   // ALL_MODES
+            .`in`(interfaceClass).unreflectSpecial(method, interfaceClass).bindTo(proxy).run {
+                if (args == null) invokeWithArguments() else invokeWithArguments(*args)
+            }
+    // otherwise, we just redispatch it to InvocationHandler
+    method.declaringClass.isAssignableFrom(javaClass) -> when {
+        method.declaringClass == Object::class.java -> when (method.name) {
+            "hashCode" -> System.identityHashCode(proxy)
+            "equals" -> proxy === args!![0]
+            "toString" -> "${proxy.javaClass.name}@${System.identityHashCode(proxy).toString(16)}"
+            else -> error("Unsupported Object method dispatched")
+        }
+        args == null -> method(this)
+        else -> method(this, *args)
+    }
+    else -> {
+        Timber.w("Unhandled method: $method(${args?.contentDeepToString()})")
+        null
+    }
+}
+
+@Suppress("FunctionName")
+fun if_nametoindex(ifname: String) = if (Build.VERSION.SDK_INT >= 26) {
+    Os.if_nametoindex(ifname)
+} else try {
+    File("/sys/class/net/$ifname/ifindex").inputStream().bufferedReader().use { it.readLine().toInt() }
+} catch (_: FileNotFoundException) {
+    NetworkInterface.getByName(ifname)?.index ?: 0
 }

@@ -4,10 +4,9 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.view.View
-import androidx.core.os.bundleOf
 import androidx.databinding.BaseObservable
 import androidx.recyclerview.widget.RecyclerView
-import be.mygod.vpnhotspot.DebugHelper
+import be.mygod.vpnhotspot.App.Companion.app
 import be.mygod.vpnhotspot.databinding.ListitemManageBinding
 import be.mygod.vpnhotspot.net.TetherOffloadManager
 
@@ -37,9 +36,12 @@ object ManageBar : Manager() {
         } catch (e1: RuntimeException) {
             try {
                 context.startActivity(Intent().setClassName(SETTINGS_PACKAGE, SETTINGS_2))
-                DebugHelper.logEvent(TAG, bundleOf(Pair(SETTINGS_1, e1.message)))
+                app.logEvent(TAG) { param(SETTINGS_1, e1.toString()) }
             } catch (e2: RuntimeException) {
-                DebugHelper.logEvent(TAG, bundleOf(Pair(SETTINGS_1, e1.message), Pair(SETTINGS_2, e2.message)))
+                app.logEvent(TAG) {
+                    param(SETTINGS_1, e1.toString())
+                    param(SETTINGS_2, e2.toString())
+                }
             }
         }
     }

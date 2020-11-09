@@ -1,57 +1,60 @@
 package be.mygod.vpnhotspot.net.monitor
 
-import android.util.LongSparseArray
-import androidx.core.os.postDelayed
-import be.mygod.vpnhotspot.DebugHelper
+import androidx.collection.LongSparseArray
+import androidx.collection.set
+import be.mygod.vpnhotspot.net.IpDev
+import be.mygod.vpnhotspot.net.MacAddressCompat
 import be.mygod.vpnhotspot.net.Routing.Companion.IPTABLES
 import be.mygod.vpnhotspot.room.AppDatabase
 import be.mygod.vpnhotspot.room.TrafficRecord
 import be.mygod.vpnhotspot.util.Event2
 import be.mygod.vpnhotspot.util.RootSession
 import be.mygod.vpnhotspot.util.parseNumericAddress
-import be.mygod.vpnhotspot.util.putIfAbsentCompat
 import be.mygod.vpnhotspot.widget.SmartSnackbar
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.*
 import timber.log.Timber
 import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 
 object TrafficRecorder {
-    private const val TAG = "TrafficRecorder"
     private const val ANYWHERE = "0.0.0.0/0"
 
-    private var scheduled = false
     private var lastUpdate = 0L
-    private val records = HashMap<Pair<InetAddress, String>, TrafficRecord>()
+    private val records = mutableMapOf<IpDev, TrafficRecord>()
     val foregroundListeners = Event2<Collection<TrafficRecord>, LongSparseArray<TrafficRecord>>()
 
-    fun register(ip: InetAddress, downstream: String, mac: Long) {
-        val record = TrafficRecord(mac = mac, ip = ip, downstream = downstream)
-        runBlocking { AppDatabase.instance.trafficRecordDao.insert(record) }
+    fun register(ip: InetAddress, downstream: String, mac: MacAddressCompat) {
+        val record = TrafficRecord(mac = mac.addr, ip = ip, downstream = downstream)
+        AppDatabase.instance.trafficRecordDao.insert(record)
         synchronized(this) {
-            DebugHelper.log(TAG, "Registering $ip%$downstream")
-            check(records.putIfAbsentCompat(Pair(ip, downstream), record) == null)
+            val key = IpDev(ip, downstream)
+            Timber.d("Registering $key")
+            check(records.putIfAbsent(key, record) == null)
             scheduleUpdateLocked()
         }
     }
     fun unregister(ip: InetAddress, downstream: String) = synchronized(this) {
         update()    // flush stats before removing
-        DebugHelper.log(TAG, "Unregistering $ip%$downstream")
-        if (records.remove(Pair(ip, downstream)) == null) Timber.w("Failed to find traffic record for $ip%$downstream.")
+        val key = IpDev(ip, downstream)
+        Timber.d("Unregistering $key")
+        if (records.remove(key) == null) Timber.w("Failed to find traffic record for $key.")
     }
 
+    private var updateJob: Job? = null
     private fun unscheduleUpdateLocked() {
-        RootSession.handler.removeCallbacksAndMessages(this)
-        scheduled = false
+        updateJob?.cancel()
+        updateJob = null
     }
     private fun scheduleUpdateLocked() {
-        if (scheduled) return
+        if (updateJob != null) return
         val now = System.currentTimeMillis()
         val minute = TimeUnit.MINUTES.toMillis(1)
         var timeout = minute - now % minute
         if (foregroundListeners.isNotEmpty() && timeout > 1000) timeout = 1000
-        RootSession.handler.postDelayed(timeout, this) { update(true) }
-        scheduled = true
+        updateJob = GlobalScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            delay(timeout)
+            update(true)
+        }
     }
 
     fun rescheduleUpdate() = synchronized(this) {
@@ -64,10 +67,11 @@ object TrafficRecorder {
         loop@ for (line in RootSession.use {
             val command = "$IPTABLES -nvx -L vpnhotspot_acl"
             val result = it.execQuiet(command)
-            val message = RootSession.checkOutput(command, result, false, false)
+            val message = result.message(listOf(command))
             if (result.err.isNotEmpty()) Timber.i(message)
-            result.out.drop(2)
+            result.out.lineSequence().drop(2)
         }) {
+            if (line.isBlank()) continue
             val columns = line.split("\\s+".toRegex()).filter { it.isNotEmpty() }
             try {
                 check(columns.size >= 9)
@@ -80,7 +84,7 @@ object TrafficRecorder {
                         check(isReceive != isSend) { "Failed to set up blocking rules, please clean routing rules" }
                         val ip = parseNumericAddress(columns[if (isReceive) 8 else 7])
                         val downstream = columns[if (isReceive) 6 else 5]
-                        val key = Pair(ip, downstream)
+                        val key = IpDev(ip, downstream)
                         val oldRecord = records[key] ?: continue@loop   // assuming they're legacy old rules
                         val record = if (oldRecord.id == null) oldRecord else TrafficRecord(
                                 timestamp = timestamp,
@@ -105,7 +109,7 @@ object TrafficRecorder {
                         }
                         if (oldRecord.id != null) {
                             check(records.put(key, record) == oldRecord)
-                            oldRecords.put(oldRecord.id!!, oldRecord)
+                            oldRecords[oldRecord.id!!] = oldRecord
                         }
                     }
                     else -> check(false)
@@ -120,23 +124,24 @@ object TrafficRecorder {
             check(record.sentBytes >= 0)
             check(record.receivedPackets >= 0)
             check(record.receivedBytes >= 0)
-            runBlocking { AppDatabase.instance.trafficRecordDao.insert(record) }
+            AppDatabase.instance.trafficRecordDao.insert(record)
         }
         foregroundListeners(records.values, oldRecords)
     }
     fun update(timeout: Boolean = false) {
         synchronized(this) {
-            if (timeout) scheduled = false
             if (records.isEmpty()) return
             val timestamp = System.currentTimeMillis()
             if (!timeout && timestamp - lastUpdate <= 100) return
             try {
                 doUpdate(timestamp)
-            } catch (e: RuntimeException) {
+            } catch (_: CancellationException) {
+            } catch (e: Exception) {
                 Timber.w(e)
                 SmartSnackbar.make(e).show()
             }
             lastUpdate = timestamp
+            updateJob = null
             scheduleUpdateLocked()
         }
     }
@@ -144,12 +149,12 @@ object TrafficRecorder {
     fun clean() = synchronized(this) {
         update()
         unscheduleUpdateLocked()
-        DebugHelper.log(TAG, "Cleaning records")
+        Timber.d("Cleaning records")
         records.clear()
     }
 
     /**
      * Possibly inefficient. Don't call this too often.
      */
-    fun isWorking(mac: Long) = records.values.any { it.mac == mac }
+    fun isWorking(mac: MacAddressCompat) = records.values.any { it.mac == mac.addr }
 }

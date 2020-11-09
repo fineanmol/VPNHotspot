@@ -1,65 +1,122 @@
 package be.mygod.vpnhotspot.net
 
 import android.content.res.Resources
+import android.os.Build
+import androidx.annotation.DrawableRes
+import androidx.annotation.RequiresApi
 import be.mygod.vpnhotspot.App.Companion.app
 import be.mygod.vpnhotspot.R
+import be.mygod.vpnhotspot.util.Event0
+import timber.log.Timber
 import java.util.regex.Pattern
 
-enum class TetherType {
-    NONE, WIFI_P2P, USB, WIFI, WIMAX, BLUETOOTH;
+enum class TetherType(@DrawableRes val icon: Int) {
+    NONE(R.drawable.ic_device_wifi_tethering),
+    WIFI_P2P(R.drawable.ic_action_settings_input_antenna),
+    USB(R.drawable.ic_device_usb),
+    WIFI(R.drawable.ic_device_network_wifi),
+    BLUETOOTH(R.drawable.ic_device_bluetooth),
+    // if you have an issue with these Ethernet icon namings, blame Google
+    NCM(R.drawable.ic_action_settings_ethernet),
+    ETHERNET(R.drawable.ic_content_inbox),
+    WIGIG(R.drawable.ic_image_flash_on),
+    ;
 
-    val icon get() = when (this) {
-        USB -> R.drawable.ic_device_usb
-        WIFI_P2P -> R.drawable.ic_action_settings_input_antenna
-        WIFI, WIMAX -> R.drawable.ic_device_network_wifi
-        BLUETOOTH -> R.drawable.ic_device_bluetooth
-        else -> R.drawable.ic_device_wifi_tethering
-    }
     val isWifi get() = when (this) {
-        WIFI_P2P, WIFI, WIMAX -> true
+        WIFI_P2P, WIFI, WIGIG -> true
         else -> false
     }
 
-    companion object {
-        private val usbRegexs: List<Pattern>
-        private val wifiRegexs: List<Pattern>
-        private val wimaxRegexs: List<Pattern>
-        private val bluetoothRegexs: List<Pattern>
+    companion object : TetheringManager.TetheringEventCallback {
+        private lateinit var usbRegexs: List<Pattern>
+        private lateinit var wifiRegexs: List<Pattern>
+        private var wigigRegexs = emptyList<Pattern>()
+        private var wifiP2pRegexs = emptyList<Pattern>()
+        private lateinit var bluetoothRegexs: List<Pattern>
+        private var ncmRegexs = emptyList<Pattern>()
+        private val ethernetRegex: Pattern?
+        private var requiresUpdate = false
 
-        /**
-         * Source: https://android.googlesource.com/platform/frameworks/base/+/61fa313/core/res/res/values/config.xml#328
-         */
-        init {
-            val appRes = app.resources
-            val sysRes = Resources.getSystem()
-            usbRegexs = appRes.getStringArray(sysRes
-                    .getIdentifier("config_tether_usb_regexs", "array", "android"))
-                    .filterNotNull()
-                    .map { it.toPattern() }
-            wifiRegexs = appRes.getStringArray(sysRes
-                    .getIdentifier("config_tether_wifi_regexs", "array", "android"))
-                    .filterNotNull()
-                    .map { it.toPattern() }
-            wimaxRegexs = appRes.getStringArray(sysRes
-                    .getIdentifier("config_tether_wimax_regexs", "array", "android"))
-                    .filterNotNull()
-                    .map { it.toPattern() }
-            bluetoothRegexs = appRes.getStringArray(sysRes
-                    .getIdentifier("config_tether_bluetooth_regexs", "array", "android"))
-                    .filterNotNull()
-                    .map { it.toPattern() }
+        @RequiresApi(30)    // unused on lower APIs
+        val listener = Event0()
+
+        private fun Pair<String?, Resources>.getRegexs(name: String) = second.getIdentifier(name, "array", first).let {
+            if (it == 0) {
+                if (name == "config_tether_wigig_regexs") Timber.i("$name is empty") else Timber.w(Exception(name))
+                emptyList()
+            } else try {
+                second.getStringArray(it).filterNotNull().map { it.toPattern() }
+            } catch (_: Resources.NotFoundException) {
+                Timber.w(Exception("$name not found"))
+                emptyList()
+            }
+        }
+
+        @RequiresApi(30)
+        private fun updateRegexs() = synchronized(this) {
+            if (!requiresUpdate) return@synchronized
+            requiresUpdate = false
+            TetheringManager.registerTetheringEventCallback(null, this)
+            val tethering = "com.android.networkstack.tethering" to app.packageManager.getResourcesForApplication(
+                    TetheringManager.resolvedService.serviceInfo.applicationInfo)
+            usbRegexs = tethering.getRegexs("config_tether_usb_regexs")
+            wifiRegexs = tethering.getRegexs("config_tether_wifi_regexs")
+            wigigRegexs = tethering.getRegexs("config_tether_wigig_regexs")
+            wifiP2pRegexs = tethering.getRegexs("config_tether_wifi_p2p_regexs")
+            bluetoothRegexs = tethering.getRegexs("config_tether_bluetooth_regexs")
+            ncmRegexs = tethering.getRegexs("config_tether_ncm_regexs")
+        }
+
+        @RequiresApi(30)
+        override fun onTetherableInterfaceRegexpsChanged(args: Array<out Any?>?) = synchronized(this) {
+            if (requiresUpdate) return@synchronized
+            Timber.i("onTetherableInterfaceRegexpsChanged: ${args?.contentDeepToString()}")
+            TetheringManager.unregisterTetheringEventCallback(this)
+            requiresUpdate = true
+            listener()
         }
 
         /**
-         * Based on: https://android.googlesource.com/platform/frameworks/base/+/0e3d092/services/core/java/com/android/server/connectivity/Tethering.java#311
+         * Source: https://android.googlesource.com/platform/frameworks/base/+/32e772f/packages/Tethering/src/com/android/networkstack/tethering/TetheringConfiguration.java#93
          */
-        fun ofInterface(iface: String?, p2pDev: String? = null) = when {
+        init {
+            val system = "android" to Resources.getSystem()
+            if (Build.VERSION.SDK_INT >= 30) requiresUpdate = true else {
+                usbRegexs = system.getRegexs("config_tether_usb_regexs")
+                wifiRegexs = system.getRegexs("config_tether_wifi_regexs")
+                bluetoothRegexs = system.getRegexs("config_tether_bluetooth_regexs")
+            }
+            // available since Android 4.0: https://android.googlesource.com/platform/frameworks/base/+/c96a667162fab44a250503caccb770109a9cb69a
+            ethernetRegex = try {
+                system.second.getString(system.second.getIdentifier("config_ethernet_iface_regex", "string",
+                        system.first)).run { if (isEmpty()) null else toPattern() }
+            } catch (_: Resources.NotFoundException) {
+                null
+            }
+        }
+
+        /**
+         * The result could change for the same interface since API 30+.
+         * It will be triggered by [TetheringManager.TetheringEventCallback.onTetherableInterfaceRegexpsChanged].
+         *
+         * Based on: https://android.googlesource.com/platform/frameworks/base/+/5d36f01/packages/Tethering/src/com/android/networkstack/tethering/Tethering.java#479
+         */
+        fun ofInterface(iface: String?, p2pDev: String? = null) = synchronized(this) { ofInterfaceImpl(iface, p2pDev) }
+        private tailrec fun ofInterfaceImpl(iface: String?, p2pDev: String?): TetherType = when {
             iface == null -> NONE
             iface == p2pDev -> WIFI_P2P
+            requiresUpdate -> {
+                Timber.d("requiresUpdate")
+                if (Build.VERSION.SDK_INT >= 30) updateRegexs() else error("unexpected requiresUpdate")
+                ofInterfaceImpl(iface, p2pDev)
+            }
             wifiRegexs.any { it.matcher(iface).matches() } -> WIFI
+            wigigRegexs.any { it.matcher(iface).matches() } -> WIGIG
+            wifiP2pRegexs.any { it.matcher(iface).matches() } -> WIFI_P2P
             usbRegexs.any { it.matcher(iface).matches() } -> USB
             bluetoothRegexs.any { it.matcher(iface).matches() } -> BLUETOOTH
-            wimaxRegexs.any { it.matcher(iface).matches() } -> WIMAX
+            ncmRegexs.any { it.matcher(iface).matches() } -> NCM
+            ethernetRegex?.matcher(iface)?.matches() == true -> ETHERNET
             else -> NONE
         }
     }

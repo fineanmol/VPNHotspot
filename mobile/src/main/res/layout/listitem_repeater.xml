@@ -24,6 +24,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_gravity="center_vertical"
+                android:importantForAccessibility="no"
                 android:src="@drawable/ic_action_settings_input_antenna"
                 android:tint="?android:attr/textColorPrimary"/>
 
@@ -74,7 +75,7 @@
             android:background="?android:attr/selectableItemBackground"
             android:padding="16dp"
             android:onClick="@{_ -> data.wps()}"
-            android:visibility="@{data.serviceStarted &amp;&amp; WifiP2pManagerHelper.startWps != null}">
+            android:visibility="@{data.serviceStarted &amp;&amp; WifiP2pManagerHelper.getStartWps() != null}">
 
             <Space
                 android:layout_width="40dp"
@@ -84,7 +85,8 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_gravity="center_vertical"
-                android:src="@drawable/ic_wps"
+                android:importantForAccessibility="no"
+                android:src="@drawable/ic_action_wifi_protected_setup"
                 android:tint="?android:attr/textColorPrimary"/>
 
             <Space

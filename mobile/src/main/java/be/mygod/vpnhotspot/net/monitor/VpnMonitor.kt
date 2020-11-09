@@ -1,101 +1,73 @@
 package be.mygod.vpnhotspot.net.monitor
 
-import android.net.*
-import be.mygod.vpnhotspot.App.Companion.app
-import be.mygod.vpnhotspot.DebugHelper
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import be.mygod.vpnhotspot.util.Services
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
 import timber.log.Timber
 
 object VpnMonitor : UpstreamMonitor() {
-    private const val TAG = "VpnMonitor"
-
-    private val request = NetworkRequest.Builder()
+    private val request = networkRequestBuilder()
             .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
             .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .build()
     private var registered = false
 
-    private val available = HashMap<Network, LinkProperties>()
+    private val available = HashMap<Network, LinkProperties?>()
     private var currentNetwork: Network? = null
-    override val currentLinkProperties: LinkProperties? get() {
-        val currentNetwork = currentNetwork
-        return if (currentNetwork == null) null else available[currentNetwork]
-    }
+    override val currentLinkProperties: LinkProperties? get() = currentNetwork?.let { available[it] }
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
-            val properties = app.connectivity.getLinkProperties(network)
-            val ifname = properties?.interfaceName ?: return
+            val properties = Services.connectivity.getLinkProperties(network)
             synchronized(this@VpnMonitor) {
-                val old = currentNetwork
-                val oldProperties = available.put(network, properties)
-                if (old != network) {
-                    if (old != null) {
-                        DebugHelper.log(TAG, "Assuming old VPN interface ${available[old]} is dying")
-                        callbacks.forEach { it.onLost() }
-                    }
-                    currentNetwork = network
-                } else {
-                    check(ifname == oldProperties!!.interfaceName)
-                    if (properties.dnsServers == oldProperties.dnsServers) return
-                }
-                callbacks.forEach { it.onAvailable(ifname, properties.dnsServers) }
-            }
+                available[network] = properties
+                currentNetwork = network
+                callbacks.toList()
+            }.forEach { it.onAvailable(properties) }
         }
 
         override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) {
             synchronized(this@VpnMonitor) {
-                if (currentNetwork == null) {
-                    onAvailable(network)
-                    return
-                }
-                if (currentNetwork != network) return
-                val oldProperties = available.put(network, properties)!!
-                val ifname = properties.interfaceName
-                when {
-                    ifname == null -> {
-                        Timber.w("interfaceName became null: $oldProperties -> $properties")
-                        onLost(network)
-                    }
-                    ifname != oldProperties.interfaceName -> {
-                        Timber.w("interfaceName changed: $oldProperties -> $properties")
-                        callbacks.forEach {
-                            it.onLost()
-                            it.onAvailable(ifname, properties.dnsServers)
-                        }
-                    }
-                    properties.dnsServers != oldProperties.dnsServers -> callbacks.forEach {
-                        it.onAvailable(ifname, properties.dnsServers)
-                    }
-                }
-            }
+                available[network] = properties
+                if (currentNetwork == null) currentNetwork = network
+                else if (currentNetwork != network) return
+                callbacks.toList()
+            }.forEach { it.onAvailable(properties) }
         }
 
-        override fun onLost(network: Network) = synchronized(this@VpnMonitor) {
-            if (available.remove(network) == null || currentNetwork != network) return
-            callbacks.forEach { it.onLost() }
-            if (available.isNotEmpty()) {
-                val next = available.entries.first()
-                currentNetwork = next.key
-                DebugHelper.log(TAG, "Switching to ${next.value.interfaceName} as VPN interface")
-                callbacks.forEach { it.onAvailable(next.value.interfaceName!!, next.value.dnsServers) }
-            } else currentNetwork = null
+        override fun onLost(network: Network) {
+            var properties: LinkProperties? = null
+            synchronized(this@VpnMonitor) {
+                if (available.remove(network) == null || currentNetwork != network) return
+                if (available.isNotEmpty()) {
+                    val next = available.entries.first()
+                    currentNetwork = next.key
+                    Timber.d("Switching to ${next.value} as VPN interface")
+                    properties = next.value
+                } else currentNetwork = null
+                callbacks.toList()
+            }.forEach { it.onAvailable(properties) }
         }
     }
 
     override fun registerCallbackLocked(callback: Callback) {
         if (registered) {
             val currentLinkProperties = currentLinkProperties
-            if (currentLinkProperties != null) {
-                callback.onAvailable(currentLinkProperties.interfaceName!!, currentLinkProperties.dnsServers)
+            if (currentLinkProperties != null) GlobalScope.launch {
+                callback.onAvailable(currentLinkProperties)
             }
         } else {
-            app.connectivity.registerNetworkCallback(request, networkCallback)
+            Services.connectivity.registerNetworkCallback(request, networkCallback)
             registered = true
         }
     }
 
     override fun destroyLocked() {
         if (!registered) return
-        app.connectivity.unregisterNetworkCallback(networkCallback)
+        Services.connectivity.unregisterNetworkCallback(networkCallback)
         registered = false
         available.clear()
         currentNetwork = null

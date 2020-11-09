@@ -1,15 +1,11 @@
 package be.mygod.vpnhotspot
 
-import android.content.Intent
 import android.os.Bundle
 import android.view.MenuItem
+import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.databinding.DataBindingUtil
 import androidx.fragment.app.Fragment
-import androidx.lifecycle.ViewModelProviders
-import androidx.lifecycle.get
-import androidx.lifecycle.observe
 import be.mygod.vpnhotspot.client.ClientViewModel
 import be.mygod.vpnhotspot.client.ClientsFragment
 import be.mygod.vpnhotspot.databinding.ActivityMainBinding
@@ -17,24 +13,26 @@ import be.mygod.vpnhotspot.manage.TetheringFragment
 import be.mygod.vpnhotspot.net.IpNeighbour
 import be.mygod.vpnhotspot.net.wifi.WifiDoubleLock
 import be.mygod.vpnhotspot.util.ServiceForegroundConnector
+import be.mygod.vpnhotspot.util.Services
 import be.mygod.vpnhotspot.widget.SmartSnackbar
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import java.net.Inet4Address
 
 class MainActivity : AppCompatActivity(), BottomNavigationView.OnNavigationItemSelectedListener {
-    private lateinit var binding: ActivityMainBinding
+    lateinit var binding: ActivityMainBinding
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        binding = DataBindingUtil.setContentView(this, R.layout.activity_main)
-        binding.lifecycleOwner = this
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
         binding.navigation.setOnNavigationItemSelectedListener(this)
         if (savedInstanceState == null) displayFragment(TetheringFragment())
-        val model = ViewModelProviders.of(this).get<ClientViewModel>()
-        if (RepeaterService.supported) ServiceForegroundConnector(this, model, RepeaterService::class)
+        val model by viewModels<ClientViewModel>()
+        lifecycle.addObserver(model)
+        if (Services.p2p != null) ServiceForegroundConnector(this, model, RepeaterService::class)
         model.clients.observe(this) { clients ->
             val count = clients.count {
-                it.ip.any { (ip, state) -> ip is Inet4Address && state != IpNeighbour.State.FAILED }
+                it.ip.any { (ip, state) -> ip is Inet4Address && state == IpNeighbour.State.VALID }
             }
             if (count > 0) binding.navigation.getOrCreateBadge(R.id.navigation_clients).apply {
                 backgroundColor = ContextCompat.getColor(this@MainActivity, R.color.colorSecondary)
@@ -42,7 +40,7 @@ class MainActivity : AppCompatActivity(), BottomNavigationView.OnNavigationItemS
                 number = count
             } else binding.navigation.removeBadge(R.id.navigation_clients)
         }
-        SmartSnackbar.Register(lifecycle, binding.fragmentHolder)
+        SmartSnackbar.Register(binding.fragmentHolder)
         WifiDoubleLock.ActivityListener(this)
     }
 
@@ -73,9 +71,4 @@ class MainActivity : AppCompatActivity(), BottomNavigationView.OnNavigationItemS
 
     private fun displayFragment(fragment: Fragment) =
             supportFragmentManager.beginTransaction().replace(R.id.fragmentHolder, fragment).commitAllowingStateLoss()
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        supportFragmentManager.findFragmentByTag("donationsFragment")?.onActivityResult(requestCode, resultCode, data)
-    }
 }

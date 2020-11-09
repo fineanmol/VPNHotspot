@@ -1,12 +1,12 @@
 package be.mygod.vpnhotspot.client
 
 import android.content.DialogInterface
+import android.os.Build
 import android.os.Bundle
 import android.os.Parcelable
 import android.text.format.DateUtils
 import android.text.format.Formatter
 import android.text.method.LinkMovementMethod
-import android.util.LongSparseArray
 import android.view.LayoutInflater
 import android.view.MenuItem
 import android.view.View
@@ -14,13 +14,12 @@ import android.view.ViewGroup
 import android.widget.EditText
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.widget.PopupMenu
+import androidx.collection.LongSparseArray
 import androidx.databinding.BaseObservable
-import androidx.databinding.DataBindingUtil
 import androidx.fragment.app.Fragment
-import androidx.lifecycle.ViewModelProviders
-import androidx.lifecycle.get
+import androidx.fragment.app.activityViewModels
+import androidx.lifecycle.findViewTreeLifecycleOwner
 import androidx.lifecycle.lifecycleScope
-import androidx.lifecycle.observe
 import androidx.recyclerview.widget.DefaultItemAnimator
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.ListAdapter
@@ -31,30 +30,28 @@ import be.mygod.vpnhotspot.Empty
 import be.mygod.vpnhotspot.R
 import be.mygod.vpnhotspot.databinding.FragmentClientsBinding
 import be.mygod.vpnhotspot.databinding.ListitemClientBinding
+import be.mygod.vpnhotspot.net.MacAddressCompat
+import be.mygod.vpnhotspot.net.TetherType
 import be.mygod.vpnhotspot.net.monitor.IpNeighbourMonitor
 import be.mygod.vpnhotspot.net.monitor.TrafficRecorder
 import be.mygod.vpnhotspot.room.AppDatabase
 import be.mygod.vpnhotspot.room.ClientStats
 import be.mygod.vpnhotspot.room.TrafficRecord
-import be.mygod.vpnhotspot.room.macToString
 import be.mygod.vpnhotspot.util.SpanFormatter
-import be.mygod.vpnhotspot.util.computeIfAbsentCompat
+import be.mygod.vpnhotspot.util.showAllowingStateLoss
 import be.mygod.vpnhotspot.util.toPluralInt
 import be.mygod.vpnhotspot.widget.SmartSnackbar
 import kotlinx.android.parcel.Parcelize
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.*
 import java.text.NumberFormat
 
 class ClientsFragment : Fragment() {
     @Parcelize
-    data class NicknameArg(val mac: Long, val nickname: CharSequence) : Parcelable
+    data class NicknameArg(val mac: MacAddressCompat, val nickname: CharSequence) : Parcelable
     class NicknameDialogFragment : AlertDialogFragment<NicknameArg, Empty>() {
         override fun AlertDialog.Builder.prepare(listener: DialogInterface.OnClickListener) {
             setView(R.layout.dialog_nickname)
-            setTitle(getString(R.string.clients_nickname_title, arg.mac.macToString()))
+            setTitle(getString(R.string.clients_nickname_title, arg.mac.toString()))
             setPositiveButton(android.R.string.ok, listener)
             setNegativeButton(android.R.string.cancel, null)
             setNeutralButton(emojize(getText(R.string.clients_nickname_set_to_vendor)), listener)
@@ -83,7 +80,7 @@ class ClientsFragment : Fragment() {
     data class StatsArg(val title: CharSequence, val stats: ClientStats) : Parcelable
     class StatsDialogFragment : AlertDialogFragment<StatsArg, Empty>() {
         override fun AlertDialog.Builder.prepare(listener: DialogInterface.OnClickListener) {
-            setTitle(SpanFormatter.format(getString(R.string.clients_stats_title), arg.title))
+            setTitle(SpanFormatter.format(getText(R.string.clients_stats_title), arg.title))
             val context = context
             val resources = resources
             val format = NumberFormat.getIntegerInstance(resources.configuration.locale)
@@ -107,14 +104,16 @@ class ClientsFragment : Fragment() {
             receive = -1
         }
 
-        override fun toString() = if (send < 0 || receive < 0) "" else
-                "▲ ${Formatter.formatFileSize(app, send)}/s\t\t▼ ${Formatter.formatFileSize(app, receive)}/s"
+        override fun toString() = if (send < 0 || receive < 0) "" else {
+            "▲ ${Formatter.formatFileSize(app, send)}/s\t\t▼ ${Formatter.formatFileSize(app, receive)}/s"
+        }
     }
 
-    private inner class ClientViewHolder(val binding: ListitemClientBinding) : RecyclerView.ViewHolder(binding.root),
-            View.OnClickListener, PopupMenu.OnMenuItemClickListener {
+    private inner class ClientViewHolder(parent: ViewGroup, val binding: ListitemClientBinding =
+            ListitemClientBinding.inflate(LayoutInflater.from(parent.context), parent, false)) :
+            RecyclerView.ViewHolder(binding.root), View.OnClickListener, PopupMenu.OnMenuItemClickListener {
         init {
-            binding.lifecycleOwner = this@ClientsFragment
+            binding.lifecycleOwner = parent.findViewTreeLifecycleOwner()!!
             binding.root.setOnClickListener(this)
             binding.description.movementMethod = LinkMovementMethod.getInstance()
         }
@@ -132,8 +131,9 @@ class ClientsFragment : Fragment() {
             return when (item?.itemId) {
                 R.id.nickname -> {
                     val client = binding.client ?: return false
-                    NicknameDialogFragment().withArg(NicknameArg(client.mac, client.nickname))
-                            .show(this@ClientsFragment)
+                    NicknameDialogFragment().apply {
+                        arg(NicknameArg(client.mac, client.nickname))
+                    }.showAllowingStateLoss(parentFragmentManager)
                     true
                 }
                 R.id.block, R.id.unblock -> {
@@ -145,7 +145,7 @@ class ClientsFragment : Fragment() {
                             AppDatabase.instance.clientRecordDao.update(this@apply)
                         }
                     }
-                    IpNeighbourMonitor.instance?.flush()
+                    IpNeighbourMonitor.instance?.flushAsync()
                     if (!wasWorking && item.itemId == R.id.block) {
                         SmartSnackbar.make(R.string.clients_popup_block_service_inactive).show()
                     }
@@ -153,12 +153,12 @@ class ClientsFragment : Fragment() {
                 }
                 R.id.stats -> {
                     binding.client?.let { client ->
-                        lifecycleScope.launchWhenCreated {
+                        viewLifecycleOwner.lifecycleScope.launchWhenCreated {
                             withContext(Dispatchers.Unconfined) {
-                                StatsDialogFragment().withArg(StatsArg(
-                                        client.title.value ?: return@withContext,
-                                        AppDatabase.instance.trafficRecordDao.queryStats(client.mac)
-                                )).show(this@ClientsFragment)
+                                StatsDialogFragment().apply {
+                                    arg(StatsArg(client.title.value ?: return@withContext,
+                                            AppDatabase.instance.trafficRecordDao.queryStats(client.mac.addr)))
+                                }.showAllowingStateLoss(parentFragmentManager)
                             }
                         }
                     }
@@ -170,19 +170,20 @@ class ClientsFragment : Fragment() {
     }
 
     private inner class ClientAdapter : ListAdapter<Client, ClientViewHolder>(Client) {
+        var size = CompletableDeferred(0)
+
         override fun submitList(list: MutableList<Client>?) {
-            super.submitList(list)
+            val deferred = CompletableDeferred<Int>()
+            size = deferred
+            super.submitList(list) { deferred.complete(list?.size ?: 0) }
             binding.swipeRefresher.isRefreshing = false
         }
 
-        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) =
-                ClientViewHolder(ListitemClientBinding.inflate(LayoutInflater.from(parent.context), parent, false))
-
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) = ClientViewHolder(parent)
         override fun onBindViewHolder(holder: ClientViewHolder, position: Int) {
             val client = getItem(position)
             holder.binding.client = client
-            holder.binding.rate =
-                    rates.computeIfAbsentCompat(Pair(client.iface, client.mac)) { TrafficRate() }
+            holder.binding.rate = rates.computeIfAbsent(client.iface to client.mac) { TrafficRate() }
             holder.binding.executePendingBindings()
         }
 
@@ -197,7 +198,9 @@ class ClientsFragment : Fragment() {
                     check(newRecord.receivedPackets == oldRecord.receivedPackets)
                     check(newRecord.receivedBytes == oldRecord.receivedBytes)
                 } else {
-                    val rate = rates.computeIfAbsentCompat(Pair(newRecord.downstream, newRecord.mac)) { TrafficRate() }
+                    val rate = rates.computeIfAbsent(newRecord.downstream to MacAddressCompat(newRecord.mac)) {
+                        TrafficRate()
+                    }
                     if (rate.send < 0 || rate.receive < 0) {
                         rate.send = 0
                         rate.receive = 0
@@ -212,33 +215,40 @@ class ClientsFragment : Fragment() {
 
     private lateinit var binding: FragmentClientsBinding
     private val adapter = ClientAdapter()
-    private var rates = HashMap<Pair<String, Long>, TrafficRate>()
+    private var rates = mutableMapOf<Pair<String, MacAddressCompat>, TrafficRate>()
 
-    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
-        binding = DataBindingUtil.inflate(inflater, R.layout.fragment_clients, container, false)
-        binding.lifecycleOwner = this
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+        binding = FragmentClientsBinding.inflate(inflater, container, false)
         binding.clients.layoutManager = LinearLayoutManager(context, RecyclerView.VERTICAL, false)
         binding.clients.itemAnimator = DefaultItemAnimator()
         binding.clients.adapter = adapter
         binding.swipeRefresher.setColorSchemeResources(R.color.colorSecondary)
-        binding.swipeRefresher.setOnRefreshListener {
-            IpNeighbourMonitor.instance?.flush()
-        }
-        ViewModelProviders.of(requireActivity()).get<ClientViewModel>().clients.observe(this) {
-            adapter.submitList(it.toMutableList())
+        binding.swipeRefresher.setOnRefreshListener { IpNeighbourMonitor.instance?.flushAsync() }
+        activityViewModels<ClientViewModel>().value.apply {
+            lifecycle.addObserver(fullMode)
+            clients.observe(viewLifecycleOwner) { adapter.submitList(it.toMutableList()) }
         }
         return binding.root
     }
 
     override fun onStart() {
+        // icon might be changed due to TetherType changes
+        if (Build.VERSION.SDK_INT >= 30) TetherType.listener[this] = {
+            lifecycleScope.launchWhenStarted { adapter.notifyItemRangeChanged(0, adapter.size.await()) }
+        }
         super.onStart()
         // we just put these two thing together as this is the only place we need to use this event for now
         TrafficRecorder.foregroundListeners[this] = adapter::updateTraffic
-        TrafficRecorder.rescheduleUpdate()  // next schedule time might be 1 min, force reschedule to <= 1s
+        lifecycleScope.launchWhenStarted {
+            withContext(Dispatchers.Default) {
+                TrafficRecorder.rescheduleUpdate()  // next schedule time might be 1 min, force reschedule to <= 1s
+            }
+        }
     }
 
     override fun onStop() {
         TrafficRecorder.foregroundListeners -= this
         super.onStop()
+        if (Build.VERSION.SDK_INT >= 30) TetherType.listener -= this
     }
 }

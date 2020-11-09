@@ -2,8 +2,11 @@ package be.mygod.vpnhotspot.net
 
 import android.content.SharedPreferences
 import be.mygod.vpnhotspot.App.Companion.app
+import be.mygod.vpnhotspot.net.Routing.Companion.IP
+import be.mygod.vpnhotspot.root.RoutingCommands
 import be.mygod.vpnhotspot.util.RootSession
 import be.mygod.vpnhotspot.widget.SmartSnackbar
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
 import timber.log.Timber
@@ -29,15 +32,17 @@ object DhcpWorkaround : SharedPreferences.OnSharedPreferenceChangeListener {
     fun enable(enabled: Boolean) = GlobalScope.launch {
         val action = if (enabled) "add" else "del"
         try {
-            RootSession.use { it.exec("ip rule $action iif lo uidrange 0-0 lookup local_network priority 11000") }
-        } catch (e: RootSession.UnexpectedOutputException) {
-            if (e.result.out.isEmpty() && (e.result.code == 2 || e.result.code == 254) && if (enabled) {
-                        e.result.err.joinToString("\n") == "RTNETLINK answers: File exists"
-                    } else {
-                        e.result.err.joinToString("\n") == "RTNETLINK answers: No such file or directory"
-                    }) return@launch
-            Timber.w(IOException("Failed to tweak dhcp workaround rule", e))
-            SmartSnackbar.make(e).show()
+            RootSession.use {
+                try {
+                    // ROUTE_TABLE_LOCAL_NETWORK: https://cs.android.com/android/platform/superproject/+/master:system/netd/server/RouteController.cpp;l=74;drc=b6dc40ac3d566d952d8445fc6ac796109c0cbc87
+                    it.exec("$IP rule $action iif lo uidrange 0-0 lookup 97 priority 11000")
+                } catch (e: RoutingCommands.UnexpectedOutputException) {
+                    if (Routing.shouldSuppressIpError(e, enabled)) return@use
+                    Timber.w(IOException("Failed to tweak dhcp workaround rule", e))
+                    SmartSnackbar.make(e).show()
+                }
+            }
+        } catch (_: CancellationException) {
         } catch (e: Exception) {
             Timber.w(e)
             SmartSnackbar.make(e).show()
